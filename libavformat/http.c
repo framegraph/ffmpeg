@@ -75,7 +75,7 @@ typedef struct HTTPContext {
     /* Used if "Transfer-Encoding: chunked" otherwise -1. */
     uint64_t chunksize;
     int chunkend;
-    uint64_t off, end_off, filesize;
+    uint64_t off, end_off, filesize, max_request_size, range_end;
     char *uri;
     char *location;
     HTTPAuthState auth_state;
@@ -174,6 +174,7 @@ static const AVOption options[] = {
     { "location", "The actual location of the data received", OFFSET(location), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
     { "offset", "initial byte offset", OFFSET(off), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
     { "end_offset", "try to limit the request to bytes preceding this offset", OFFSET(end_off), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
+    { "max_request_size", "try to limit the request to this many bytes, then reconnect", OFFSET(max_request_size), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
     { "method", "Override the HTTP method or set the expected HTTP method from a client", OFFSET(method), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
     { "reconnect", "auto reconnect after disconnect before EOF", OFFSET(reconnect), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "reconnect_at_eof", "auto reconnect at EOF", OFFSET(reconnect_at_eof), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
@@ -1522,10 +1523,16 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
     // Note: we send the Range header on purpose, even when we're probing,
     // since it allows us to detect more reliably if a (non-conforming)
     // server supports seeking by analysing the reply headers.
-    if (!has_header(s->headers, "\r\nRange: ") && !post && (s->off > 0 || s->end_off || s->seekable != 0)) {
+    if (!has_header(s->headers, "\r\nRange: ") && !post && (s->off > 0 || s->end_off || s->seekable != 0 || s->max_request_size)) {
         av_bprintf(&request, "Range: bytes=%"PRIu64"-", s->off);
-        if (s->end_off)
-            av_bprintf(&request, "%"PRId64, s->end_off - 1);
+        if (s->end_off || s->max_request_size) {
+            if (s->end_off && s->max_request_size) {
+                s->range_end = FFMIN(s->end_off, s->off + s->max_request_size);
+            } else {
+                s->range_end = FFMAX(s->end_off, s->off + s->max_request_size);
+            }
+            av_bprintf(&request, "%"PRId64, s->range_end - 1);
+        }
         av_bprintf(&request, "\r\n");
     }
     if (send_expect_100 && !has_header(s->headers, "\r\nExpect: "))
@@ -1664,7 +1671,16 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
         memcpy(buf, s->buf_ptr, len);
         s->buf_ptr += len;
     } else {
-        uint64_t target_end = s->end_off ? s->end_off : s->filesize;
+        uint64_t target_end = s->filesize;
+        if (s->end_off || s->max_request_size) {
+            if (s->end_off && s->max_request_size) {
+                target_end = FFMIN(s->end_off, s->range_end);
+            } else {
+                target_end = FFMAX(s->end_off, s->range_end);
+            }
+            target_end = FFMIN(target_end, s->filesize);
+        }
+
         if ((!s->willclose || s->chunksize == UINT64_MAX) && s->off >= target_end)
             return AVERROR_EOF;
         len = ffurl_read(s->hd, buf, size);
@@ -1762,13 +1778,16 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
             reconnect_delay_total > s->reconnect_delay_total_max)
             return AVERROR(EIO);
 
-        av_log(h, AV_LOG_WARNING, "Will reconnect at %"PRIu64" in %d second(s), error=%s.\n", s->off, reconnect_delay, av_err2str(read_ret));
-        err = ff_network_sleep_interruptible(1000U*1000*reconnect_delay, &h->interrupt_callback);
-        if (err != AVERROR(ETIMEDOUT))
-            return err;
-        reconnect_delay_total += reconnect_delay;
-        reconnect_delay = 1 + 2*reconnect_delay;
-        conn_attempts++;
+        if (!(s->max_request_size > 0 && read_ret == AVERROR_EOF)) {
+            av_log(h, AV_LOG_WARNING, "Will reconnect at %"PRIu64" in %d second(s), error=%s.\n",
+                   s->off, reconnect_delay, av_err2str(read_ret));
+            err = ff_network_sleep_interruptible(1000U*1000*reconnect_delay, &h->interrupt_callback);
+            if (err != AVERROR(ETIMEDOUT))
+                return err;
+            reconnect_delay_total += reconnect_delay;
+            reconnect_delay = 1 + 2*reconnect_delay;
+            conn_attempts++;
+        }
         seek_ret = http_seek_internal(h, target, SEEK_SET, 1);
         if (seek_ret >= 0 && seek_ret != target) {
             av_log(h, AV_LOG_ERROR, "Failed to reconnect at %"PRIu64".\n", target);
