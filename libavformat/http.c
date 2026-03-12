@@ -76,6 +76,7 @@ typedef struct HTTPContext {
     uint64_t chunksize;
     int chunkend;
     uint64_t off, end_off, filesize, max_request_size, range_end;
+    int keepalive_range_requests, preserve_offset;
     char *uri;
     char *location;
     HTTPAuthState auth_state;
@@ -140,6 +141,9 @@ typedef struct HTTPContext {
     AVDictionary *redirect_cache;
     uint64_t filesize_from_content_range;
     int respect_retry_after;
+    int redir_cache_tweaks;
+    int follow_fallback_gvs;
+    int adaptive_backoff;
     unsigned int retry_after;
     int reconnect_max_retries;
     int reconnect_delay_total_max;
@@ -174,17 +178,21 @@ static const AVOption options[] = {
     { "location", "The actual location of the data received", OFFSET(location), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
     { "offset", "initial byte offset", OFFSET(off), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
     { "end_offset", "try to limit the request to bytes preceding this offset", OFFSET(end_off), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
-    { "max_request_size", "try to limit the request to this many bytes, then reconnect", OFFSET(max_request_size), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
+    { "max_request_size", "(patch) try to limit the request to this many bytes, then reconnect", OFFSET(max_request_size), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
+    { "keepalive_range_requests", "(patch) when performing new range request, try to reuse old established connection when possible, like in HLS demuxer", OFFSET(keepalive_range_requests), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
     { "method", "Override the HTTP method or set the expected HTTP method from a client", OFFSET(method), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
-    { "reconnect", "auto reconnect after disconnect before EOF", OFFSET(reconnect), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+    { "reconnect", "auto reconnect after disconnect before EOF", OFFSET(reconnect), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
     { "reconnect_at_eof", "auto reconnect at EOF", OFFSET(reconnect_at_eof), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
-    { "reconnect_on_network_error", "auto reconnect in case of tcp/tls error during connect", OFFSET(reconnect_on_network_error), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+    { "reconnect_on_network_error", "auto reconnect in case of tcp/tls error during connect", OFFSET(reconnect_on_network_error), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
     { "reconnect_on_http_error", "list of http status codes to reconnect on", OFFSET(reconnect_on_http_error), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
     { "reconnect_streamed", "auto reconnect streamed / non seekable streams", OFFSET(reconnect_streamed), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "reconnect_delay_max", "max reconnect delay in seconds after which to give up", OFFSET(reconnect_delay_max), AV_OPT_TYPE_INT, { .i64 = 120 }, 0, UINT_MAX/1000/1000, D },
     { "reconnect_max_retries", "the max number of times to retry a connection", OFFSET(reconnect_max_retries), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, D },
     { "reconnect_delay_total_max", "max total reconnect delay in seconds after which to give up", OFFSET(reconnect_delay_total_max), AV_OPT_TYPE_INT, { .i64 = 256 }, 0, UINT_MAX/1000/1000, D },
     { "respect_retry_after", "respect the Retry-After header when retrying connections", OFFSET(respect_retry_after), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
+    { "redirect_cache_tweaks", "(patch) 0 - standard redirect caching, 1 (default) - forcefully enable redirect cache for tested websites (currently only youtube), 2 - forcefully enable for all websites", OFFSET(redir_cache_tweaks), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 2, D | E },
+    { "adaptive_backoff", "(patch) reconnect immediately in case of network timeout, rather than using exponential backoff", OFFSET(adaptive_backoff), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+    { "follow_fallback_gvs", "(patch) use fallback youtube streaming server if primary one is unreachable (experimental)", OFFSET(follow_fallback_gvs), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "listen", "listen on HTTP", OFFSET(listen), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, D | E },
     { "resource", "The resource requested by a client", OFFSET(resource), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     { "reply_code", "The http status code to return to a client", OFFSET(reply_code), AV_OPT_TYPE_INT, { .i64 = 200}, INT_MIN, 599, E},
@@ -340,6 +348,13 @@ static char *redirect_cache_get(HTTPContext *s)
         return NULL;
     }
 
+    char *p = strchr(delim + 1, ':');
+    if (p) { // печать только домена (гугловские URL-ы слишком длинные)
+        p++;
+        if (*p == '/') p++;
+        if (*p == '/') p++;
+        av_log(s, AV_LOG_VERBOSE, "(debug) Redirect cache was helpful with %.*s\n", strcspn(p, "/?#"), p);
+    }
     return delim + 1;
 }
 
@@ -358,6 +373,56 @@ static int redirect_cache_set(HTTPContext *s, const char *source, const char *de
         return ret;
 
     return 0;
+}
+
+static void try_gvs_fallback(HTTPContext *s) // спасибо за способ: https://github.com/yt-dlp/yt-dlp/issues/1986 и https://github.com/yt-dlp/yt-dlp/pull/5639/files
+{
+    char fallback_uri[MAX_URL_SIZE];
+    char *p = strchr(s->uri, ':');
+    if (p) {
+        p++;
+        if (*p == '/') p++;
+        if (*p == '/') p++;
+        
+        char *gv_pos = strstr(p, ".googlevideo.com/");
+        char *fallback_mn_pos = strstr(p, "&mn=");
+        if (fallback_mn_pos)
+            fallback_mn_pos += strcspn(++fallback_mn_pos, "%&");
+        
+        if (gv_pos && strchr(p, '/') > gv_pos && fallback_mn_pos) { // работаем только с ютуб-ссылками, содержащими резервный сервер
+            long fvip = 0;
+            char *fvip_pos = strstr(p, "&fvip=");
+            if (fvip_pos)
+                fvip = strtol(fvip_pos + 6, NULL, 10);
+            
+            if (av_strstart(fallback_mn_pos, "%2C", NULL)) {
+                fallback_mn_pos += 3;
+                snprintf(fallback_uri, sizeof(fallback_uri), "%.*srr%ld---%.*s%s&fallback_count=1", // ютуб принимает ссылки и без fallback_count, но пусть будет как в браузере
+                        p - s->uri, s->uri, (fvip > 0 && fvip < INT_MAX) ? fvip : 1, strcspn(fallback_mn_pos, "&"), fallback_mn_pos, gv_pos);
+                
+                if (strncmp(fallback_uri, s->location, strcspn(fallback_uri + (p - s->uri), "/?#") + (p - s->uri) + 1) != 0) {
+                    av_log(s, AV_LOG_WARNING, "(patch) Falling back to secondary gvs: rr%ld---%.*s.googlevideo.com\n", 
+                            (fvip > 0 && fvip < INT_MAX) ? fvip : 1, strcspn(fallback_mn_pos, "&"), fallback_mn_pos);
+                    // в s->url в конечном счёте всегда остаётся изначальный URL потока (кроме случая просмотра по HLS)
+                    // так что достаточно записать "корневое" перенаправление с исходного URL на резервный, и оно будет перманентным
+                    // но если уже случился редирект от сервера, то с него также нужно добавить перенаправление, чтобы оно сработало незамедлительно
+                    av_dict_free(&s->redirect_cache); // очистка кэша перенаправлений
+                    redirect_cache_set(s, s->uri, fallback_uri, INT64_MAX);
+                    if (strcmp(s->uri, s->location) != 0)
+                        redirect_cache_set(s, s->location, fallback_uri, INT64_MAX);
+                    return;
+                }
+            }
+            // если ошибка сети произошла уже после перехода на резервный URL (ютуб обычно не выдаёт больше резервных серверов),
+            // то считаем, что резервный сервер, возможно, также недоступен (или же сформирована неверная для ютуба ссылка), и возвращаемся на исходный URL
+            // (при очередной ошибке сети процесс может повториться)
+            if (strcmp(s->uri, s->location) != 0) {  
+                av_log(s, AV_LOG_WARNING, "(patch) Network error on fallback gvs - reverting to primary server\n");
+                av_dict_free(&s->redirect_cache);
+                redirect_cache_set(s, s->location, s->uri, INT64_MAX);
+            }
+        }
+    }
 }
 
 /* return non zero if error */
@@ -389,6 +454,7 @@ redo:
     cur_auth_type       = s->auth_state.auth_type;
     cur_proxy_auth_type = s->auth_state.auth_type;
 
+    int new_connection = s->hd == NULL;
     off = s->off;
     ret = http_open_cnx_internal(h, options);
     if (ret < 0) {
@@ -406,7 +472,13 @@ redo:
             s->retry_after = 0;
         }
 
-        av_log(h, AV_LOG_WARNING, "Will reconnect at %"PRIu64" in %d second(s).\n", off, reconnect_delay);
+        if (s->adaptive_backoff && ret == AVERROR(ETIMEDOUT)) {
+            reconnect_delay = 0;
+            av_log(h, AV_LOG_WARNING, "Reconnecting at %"PRIu64" (network timeout)\n", off);
+        }
+        else
+            av_log(h, AV_LOG_WARNING, "Will reconnect at %"PRIu64" in %d second(s).\n", off, reconnect_delay);
+        
         ret = ff_network_sleep_interruptible(1000U * 1000 * reconnect_delay, &h->interrupt_callback);
         if (ret != AVERROR(ETIMEDOUT))
             goto fail;
@@ -416,6 +488,11 @@ redo:
 
         /* restore the offset (http_connect resets it) */
         s->off = off;
+        
+        // для полноценной работы этой функции должна быть включена опция reconnect_on_network_error (после патча по умолчанию это так),
+        // а также не слишком большой таймаут сети (в mpv network-timeout по умолчанию целых 60 секунд, но в моей сборке плеера это вполне разумные 10 с)
+        if (s->follow_fallback_gvs && new_connection)
+            try_gvs_fallback(s);
 
         ffurl_closep(&s->hd);
         goto redo;
@@ -445,6 +522,31 @@ redo:
         ffurl_closep(&s->hd);
         if (redirects++ >= MAX_REDIRECTS)
             return AVERROR(EIO);
+        
+        char loc_host[1024], new_loc_host[1024];
+        char loc_path[MAX_URL_SIZE], new_loc_path[MAX_URL_SIZE];
+        av_url_split(NULL, 0, NULL, 0, loc_host, sizeof(loc_host), NULL, loc_path, MAX_URL_SIZE, s->location);
+        av_url_split(NULL, 0, NULL, 0, new_loc_host, sizeof(new_loc_host), NULL, new_loc_path, MAX_URL_SIZE, s->new_location);
+        if (strncmp(loc_host, new_loc_host, sizeof(new_loc_host)) != 0) // для упрощения отладки
+            av_log(h, AV_LOG_VERBOSE, "(debug) Cross-domain redirect %d occurred: '%s' -> '%s'\n", redirects, loc_host, new_loc_host);
+        else
+            av_log(h, AV_LOG_VERBOSE, "(debug) Internal redirect %d occurred: '%s' -> '%s'\n", redirects, loc_path, new_loc_path);
+        av_log(h, AV_LOG_VERBOSE, "(debug) Status code: %d, Expires: %"PRIi64", current time: %"PRIi64"\n", s->http_code, s->expires, time(NULL));
+        
+        // Ютуб, при перенаправлении (бывает и многократном) на другой свой CDN-сервер, делает это с заголовком Expires, равным текущему времени,
+        // что не позволяет ffmpeg-у, следующему стандартам, применять свой механизм кэширования перенаправлений
+        // из-за этого приходится при каждом новом запросе проходить всю цепочку перенаправлений с установлением нового подключения при каждом редиректе
+        // для форматов HLS ffmpeg при этом спамит ошибками "Cannot reuse HTTP connection for different host" (https://github.com/mpv-player/mpv/issues/8500),
+        // но для DASH происходит всё та же цепочка переподключений, только без сообщений в консоль
+        // в реальности же ютуб позволяет многократно пользоваться новой данной им ссылкой всё время её действия, при необходимости перенаправляя ещё раз
+        // с HLS, к сожалению, такой способ не поможет, поскольку там у каждого чанка свой уникальный URL (это ещё одна причина смотреть ютуб именно в форматах DASH)
+        char *gv = "googlevideo.com"; // в коде ffmpeg уже есть особые подходы к серверам Akamai и MediaGateway, поэтому не вижу в такой проверке ничего плохого
+        size_t lenstr = strlen(loc_host);
+        size_t lensuffix = strlen(gv);
+        char *delta_pos = loc_host + lenstr - lensuffix;
+        if (s->redir_cache_tweaks >= 1)
+            if ((lensuffix <= lenstr && strncmp(delta_pos, gv, lensuffix) == 0 && (lenstr == lensuffix || *(delta_pos - 1) == '.')) || s->redir_cache_tweaks >= 2)
+                s->expires = INT64_MAX;
 
         if (!s->expires) {
             s->expires = (s->http_code == 301 || s->http_code == 308) ? INT64_MAX : -1;
@@ -516,23 +618,26 @@ int ff_http_do_new_request2(URLContext *h, const char *uri, AVDictionary **opts)
 
     s->end_chunked_post = 0;
     s->chunkend      = 0;
-    s->off           = 0;
     s->icy_data_read = 0;
+    if (!s->preserve_offset)
+        s->off       = 0;
 
     av_free(s->location);
     s->location = av_strdup(uri);
     if (!s->location)
         return AVERROR(ENOMEM);
 
-    av_free(s->uri);
-    s->uri = av_strdup(uri);
-    if (!s->uri)
-        return AVERROR(ENOMEM);
+    if (s->uri != uri) { // в случае нового range request URL остаётся тем же и для простоты передаётся той же строкой
+        av_free(s->uri);
+        s->uri = av_strdup(uri);
+        if (!s->uri)
+            return AVERROR(ENOMEM);
+    }
 
     if ((ret = av_opt_set_dict(s, opts)) < 0)
         return ret;
 
-    av_log(s, AV_LOG_INFO, "Opening \'%s\' for %s\n", uri, h->flags & AVIO_FLAG_WRITE ? "writing" : "reading");
+    av_log(s, AV_LOG_INFO, "Opening \'%s\' for %s%s\n", uri, h->flags & AVIO_FLAG_WRITE ? "writing" : "reading", s->hd ? ", reusing old connection" : "");
     ret = http_open_cnx(h, &options);
     av_dict_free(&options);
     return ret;
@@ -719,6 +824,7 @@ static int http_open(URLContext *h, const char *uri, int flags,
         h->is_streamed = 0;
     else
         h->is_streamed = 1;
+    s->preserve_offset = 0;
 
     s->filesize = UINT64_MAX;
 
@@ -1539,7 +1645,7 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
         av_bprintf(&request, "Expect: 100-continue\r\n");
 
     if (!has_header(s->headers, "\r\nConnection: "))
-        av_bprintf(&request, "Connection: %s\r\n", s->multiple_requests ? "keep-alive" : "close");
+        av_bprintf(&request, "Connection: %s\r\n", (s->multiple_requests || s->keepalive_range_requests && s->max_request_size) ? "keep-alive" : "close");
 
     if (!has_header(s->headers, "\r\nHost: "))
         av_bprintf(&request, "Host: %s\r\n", hoststr);
@@ -1763,6 +1869,8 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
     read_ret = http_buf_read(h, buf, size);
     while (read_ret < 0) {
         uint64_t target = h->is_streamed ? 0 : s->off;
+        if (target != s->off && s->seekable != 0 && read_ret != AVERROR_EXIT && !(read_ret == AVERROR_EOF && s->max_request_size == 0))
+            av_log(h, AV_LOG_VERBOSE, "(patch) Reconnect at %"PRIu64" desired, but server doesn't support seeking!\n", s->off);
 
         if (read_ret == AVERROR_EXIT)
             break;
@@ -1770,25 +1878,81 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
         if (h->is_streamed && !s->reconnect_streamed)
             break;
 
-        if (!(s->reconnect && s->filesize > 0 && s->off < s->filesize) &&
-            !(s->reconnect_at_eof && read_ret == AVERROR_EOF))
+        if ((!(s->reconnect && s->filesize > 0 && s->off < s->filesize) && !(s->reconnect_at_eof && read_ret == AVERROR_EOF)) ||
+            // в HLS размер скачивающегося чанка в байтах не задаётся в s->filesize (в большинстве же случаев размер файла известен); 
+            // это условие, чтобы не пытаться переподключаться после штатного скачивания до конца, после которого сервер возвращает EOF
+            // в официальном ffmpeg переподключение при ошибках сети по умолчанию отключено в принципе, поэтому такой проблемы не возникает
+            (!s->reconnect_at_eof && s->filesize == UINT64_MAX && read_ret == AVERROR_EOF))
             break;
 
         if (reconnect_delay > s->reconnect_delay_max || (s->reconnect_max_retries >= 0 && conn_attempts > s->reconnect_max_retries) ||
             reconnect_delay_total > s->reconnect_delay_total_max)
             return AVERROR(EIO);
 
-        if (!(s->max_request_size > 0 && read_ret == AVERROR_EOF)) {
+        if (!(s->max_request_size > 0 && read_ret == AVERROR_EOF) || h->is_streamed == 1) {
             av_log(h, AV_LOG_WARNING, "Will reconnect at %"PRIu64" in %d second(s), error=%s.\n",
-                   s->off, reconnect_delay, av_err2str(read_ret));
+                   target, reconnect_delay, av_err2str(read_ret));
             err = ff_network_sleep_interruptible(1000U*1000*reconnect_delay, &h->interrupt_callback);
             if (err != AVERROR(ETIMEDOUT))
                 return err;
             reconnect_delay_total += reconnect_delay;
             reconnect_delay = 1 + 2*reconnect_delay;
             conn_attempts++;
+            
+            seek_ret = http_seek_internal(h, target, SEEK_SET, 1);
         }
-        seek_ret = http_seek_internal(h, target, SEEK_SET, 1);
+        else {
+            av_log(h, AV_LOG_VERBOSE, "(patch) %s new range request: %"PRIu64"-%"PRId64"\n",
+                    s->keepalive_range_requests ? "Performing" : "Reconnecting with", s->off, s->off + s->max_request_size - 1);
+            err = ff_network_sleep_interruptible(0, &h->interrupt_callback); // необходимо, чтобы не войти в бесконечный цикл и не завис плеер
+            if (err != AVERROR(ETIMEDOUT))
+                return err;
+            conn_attempts++;
+            
+            // пытаемся реиспользовать предыдущее keep-alive соединение (как это делает PotPlayer и, разумеется, браузеры)
+            // чтобы избежать дополнительных задержек от нового подключения (последовательного установления TCP и TLS соединений)
+            char *orig_uri = av_strdup(s->uri);
+            if (!orig_uri)
+                return AVERROR(ENOMEM);
+            FFSWAP(char *, s->uri, s->location);
+            for (int r = 0; r < MAX_REDIRECTS; r++) { // проверяем кэш перенаправлений заранее, чтобы пройти проверку в ff_http_do_new_request()
+                char *cached = redirect_cache_get(s);
+                if (cached) {
+                    av_free(s->location);
+                    s->location = av_strdup(cached);
+                    if (!s->location)
+                        return AVERROR(ENOMEM);
+                }
+                else
+                    break;
+            }
+            
+            int keepalive_ret = 1;
+            if (!s->keepalive_range_requests) {} // переподключение, если keep-alive запросы отключены настройками
+            else if (strcmp(s->uri, s->location) != 0)
+                av_log(h, AV_LOG_INFO, "(patch) Redirect occurred, cannot reuse HTTP connection for different host, trying with new connection\n");
+            else if (s->willclose)
+                av_log(h, AV_LOG_INFO, "(patch) Server doesn't support keepalives, cannot reuse HTTP connection, trying with new one\n");
+            else {
+                s->preserve_offset = 1;
+                keepalive_ret = ff_http_do_new_request(h, s->uri);
+                if (keepalive_ret == AVERROR_EXIT || keepalive_ret == AVERROR(EIO)) {
+                    av_free(s->uri);
+                    s->uri = orig_uri;
+                    break;
+                }
+                if (keepalive_ret < 0)
+                    av_log(h, AV_LOG_WARNING, "(patch) Keep-alive request failed with error: '%s' when performing new range request, retrying with new connection\n", av_err2str(keepalive_ret));
+            }
+            
+            av_free(s->uri);
+            s->uri = orig_uri;
+            if (keepalive_ret == 0)
+                seek_ret = s->off;
+            else
+                seek_ret = http_seek_internal(h, target, SEEK_SET, 1);
+        }
+
         if (seek_ret >= 0 && seek_ret != target) {
             av_log(h, AV_LOG_ERROR, "Failed to reconnect at %"PRIu64".\n", target);
             return read_ret;
@@ -2136,6 +2300,7 @@ static int http_proxy_open(URLContext *h, const char *uri, int flags)
         h->is_streamed = 0;
     else
         h->is_streamed = 1;
+    s->preserve_offset = 0;
 
     av_url_split(NULL, 0, auth, sizeof(auth), hostname, sizeof(hostname), &port,
                  pathbuf, sizeof(pathbuf), uri);

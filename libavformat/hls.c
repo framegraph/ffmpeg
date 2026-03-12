@@ -1536,7 +1536,7 @@ reload:
                 return AVERROR_EOF;
             }
         } else {
-            av_log(v->parent, AV_LOG_WARNING, "The m3u8 list sequence may have been wrapped.\n");
+            av_log(v->parent, AV_LOG_INFO, "The m3u8 list sequence may have been wrapped.\n");
         }
         if (v->cur_seq_no >= v->start_seq_no + v->n_segments) {
             if (v->finished)
@@ -2577,7 +2577,7 @@ static const AVOption hls_options[] = {
         {.str = "3gp,aac,avi,ac3,eac3,flac,mkv,m3u8,m4a,m4s,m4v,mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,vob,wav"},
         INT_MIN, INT_MAX, FLAGS},
     {"max_reload", "Maximum number of times a insufficient list is attempted to be reloaded",
-        OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 3}, 0, INT_MAX, FLAGS},
+        OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 100}, 0, INT_MAX, FLAGS},
     {"m3u8_hold_counters", "The maximum number of times to load m3u8 when it refreshes without new segments",
         OFFSET(m3u8_hold_counters), AV_OPT_TYPE_INT, {.i64 = 1000}, 0, INT_MAX, FLAGS},
     {"http_persistent", "Use persistent HTTP connections",
@@ -2589,7 +2589,7 @@ static const AVOption hls_options[] = {
     {"seg_format_options", "Set options for segment demuxer",
         OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
     {"seg_max_retry", "Maximum number of times to reload a segment on error.",
-     OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
+     OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 5}, 0, INT_MAX, FLAGS},
     {NULL}
 };
 
