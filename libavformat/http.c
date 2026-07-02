@@ -144,6 +144,7 @@ typedef struct HTTPContext {
     int redir_cache_tweaks;
     int follow_fallback_gvs;
     int adaptive_backoff;
+    int resume_by_discard, no_cache;
     unsigned int retry_after;
     int reconnect_max_retries;
     int reconnect_delay_total_max;
@@ -193,6 +194,7 @@ static const AVOption options[] = {
     { "redirect_cache_tweaks", "(patch) 0 - standard redirect caching, 1 (default) - forcefully enable redirect cache for tested websites (currently only youtube), 2 - forcefully enable for all websites", OFFSET(redir_cache_tweaks), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 2, D | E },
     { "adaptive_backoff", "(patch) reconnect immediately in case of network timeout, rather than using exponential backoff", OFFSET(adaptive_backoff), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "follow_fallback_gvs", "(patch) use fallback youtube streaming server if primary one is unreachable (experimental)", OFFSET(follow_fallback_gvs), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+    { "resume_by_discard", "(patch) resume from offset by discarding initial bytes when server does not support seeking", OFFSET(resume_by_discard), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "listen", "listen on HTTP", OFFSET(listen), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, D | E },
     { "resource", "The resource requested by a client", OFFSET(resource), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     { "reply_code", "The http status code to return to a client", OFFSET(reply_code), AV_OPT_TYPE_INT, { .i64 = 200}, INT_MIN, 599, E},
@@ -205,6 +207,7 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
                         const char *proxyauth);
 static int http_read_header(URLContext *h);
 static int http_shutdown(URLContext *h, int flags);
+static int http_buf_read(URLContext *h, uint8_t *buf, int size);
 
 void ff_http_init_auth_state(URLContext *dest, const URLContext *src)
 {
@@ -964,11 +967,13 @@ static int parse_location(HTTPContext *s, const char *p)
 static void parse_content_range(URLContext *h, const char *p)
 {
     HTTPContext *s = h->priv_data;
-    const char *slash;
+    const char *slash, *end;
 
     if (!strncmp(p, "bytes ", 6)) {
         p     += 6;
         s->off = strtoull(p, NULL, 10);
+        if ((end = strchr(p, '-')) && strlen(end) > 0)
+            s->range_end = strtoull(end + 1, NULL, 10) + 1;
         if ((slash = strchr(p, '/')) && strlen(slash) > 0)
             s->filesize_from_content_range = strtoull(slash + 1, NULL, 10);
     }
@@ -1200,6 +1205,7 @@ static void parse_cache_control(HTTPContext *s, const char *p)
 
     if (av_stristr(p, "no-cache") || av_stristr(p, "no-store")) {
         s->expires = -1;
+        s->no_cache = 1;
         return;
     }
 
@@ -1360,6 +1366,8 @@ static int process_line(URLContext *h, char *line, int line_count, int *parsed_h
             parse_expires(s, p);
         } else if (!av_strcasecmp(tag, "Cache-Control")) {
             parse_cache_control(s, p);
+        } else if (!av_strcasecmp(tag, "Pragma") && av_stristr(p, "no-cache")) {
+            s->no_cache = 1;
         } else if (!av_strcasecmp(tag, "Retry-After")) {
             /* The header can be either an integer that represents seconds, or a date. */
             struct tm tm;
@@ -1702,6 +1710,7 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
 #if CONFIG_ZLIB
     s->compressed       = 0;
 #endif
+    s->no_cache         = 0;
     if (post && !s->post_data && !send_expect_100) {
         /* Pretend that it did work. We didn't read any header yet, since
          * we've still to send the POST data, but the code calling this
@@ -1718,6 +1727,34 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
 
     if (s->new_location)
         s->off = off;
+    
+    if (h->is_streamed == 0 && s->seekable == -1 && off != s->off) { // в случае такой аномалии (например, стримы на Твиче) также пробуем эмулировать перемотку
+        av_log(h, AV_LOG_WARNING, "(patch) Server claims to support seeking, but returned the wrong offset! (%"PRIu64" instead of %"PRIu64")\n", s->off, off);
+        h->is_streamed = 1;
+    }
+
+    if (s->resume_by_discard && s->off == 0 && s->off < off) {
+        if (s->no_cache) // в этом случае при эмуляции перемотки результат будет повреждённым из-за изменения контента по сравнению с прошлым запросом
+            av_log(h, AV_LOG_WARNING, "(patch) Cannot emulate seek due to dynamic content\n");
+        else {
+            // отбрасываем начало полезной нагрузки (до места, на котором прервалась передача в прошлый раз), чтобы обеспечить демуксер ожидаемыми им данными
+            uint8_t discard[4096];
+            uint64_t remaining = off;
+            av_log(h, AV_LOG_WARNING, "(patch) Emulating seek to offset %"PRIu64" by draining initial bytes from response body\n", off);
+            while (remaining) {
+                int ret = http_buf_read(h, discard, FFMIN(remaining, sizeof(discard)));
+                if (ret < 0 || ret == AVERROR_EOF || (ret == 0 && remaining)) {
+                    // соединение разорвано или зависло - закрываем его, считаем за ошибку при подключении
+                    // и пробуем переподключиться (по умолчанию, привключённом reconnect_on_network_error)
+                    av_log(h, AV_LOG_ERROR, "(patch) Connection broken during seek emulation at %"PRIu64"\n", off - remaining);
+                    ffurl_closep(&s->hd);
+                    break;
+                }
+                remaining -= ret;
+            }
+            s->off = off - remaining;
+        }
+    }
 
     err = (off == s->off) ? 0 : -1;
 done:
@@ -1778,7 +1815,7 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
         s->buf_ptr += len;
     } else {
         uint64_t target_end = s->filesize;
-        if (s->end_off || s->max_request_size) {
+        if (!h->is_streamed && (s->end_off || s->max_request_size)) {
             if (s->end_off && s->max_request_size) {
                 target_end = FFMIN(s->end_off, s->range_end);
             } else {
@@ -1868,14 +1905,14 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
 #endif /* CONFIG_ZLIB */
     read_ret = http_buf_read(h, buf, size);
     while (read_ret < 0) {
-        uint64_t target = h->is_streamed ? 0 : s->off;
+        uint64_t target = (h->is_streamed && (!s->resume_by_discard || s->no_cache == 1)) ? 0 : s->off;
         if (target != s->off && s->seekable != 0 && read_ret != AVERROR_EXIT && !(read_ret == AVERROR_EOF && s->max_request_size == 0))
             av_log(h, AV_LOG_VERBOSE, "(patch) Reconnect at %"PRIu64" desired, but server doesn't support seeking!\n", s->off);
 
         if (read_ret == AVERROR_EXIT)
             break;
 
-        if (h->is_streamed && !s->reconnect_streamed)
+        if (h->is_streamed && !s->reconnect_streamed && (!s->resume_by_discard || s->no_cache == 1))
             break;
 
         if ((!(s->reconnect && s->filesize > 0 && s->off < s->filesize) && !(s->reconnect_at_eof && read_ret == AVERROR_EOF)) ||
@@ -2168,7 +2205,7 @@ static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int fo
         return AVERROR(EINVAL);
     s->off = off;
 
-    if (s->off && h->is_streamed)
+    if (s->off && h->is_streamed && !s->resume_by_discard)
         return AVERROR(ENOSYS);
 
     /* do not try to make a new connection if seeking past the end of the file */
