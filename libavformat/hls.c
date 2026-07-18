@@ -173,6 +173,9 @@ struct playlist {
      * playlist, if any. */
     int n_init_sections;
     struct segment **init_sections;
+    
+    // предыдущее состояние перехода на резервный сервер Ютуба для переноса между чанками
+    int prev_fallback_gvs_state;
 };
 
 /*
@@ -1295,6 +1298,11 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
         av_dict_set_int(&opts, "offset", seg->url_offset, 0);
         av_dict_set_int(&opts, "end_offset", seg->url_offset + seg->size, 0);
     }
+    
+    // если при открытии предыдущего чанка был осуществлён переход на резервный сервер из-за ошибки сети,
+    // при открытии текущего сразу на него переключаемся (если же на резервном сервере произойдёт ошибка, процесс обратится)
+    if (pls->prev_fallback_gvs_state == 2)
+        av_dict_set_int(&opts, "follow_fallback_gvs", 2, 0);
 
     av_log(pls->parent, AV_LOG_VERBOSE, "HLS request for url '%s', offset %"PRId64", playlist %d\n",
            seg->url, seg->url_offset, pls->index);
@@ -1356,6 +1364,10 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
             ff_format_io_close(pls->parent, in);
         }
     }
+    
+    int64_t fallback_gvs_state;
+    if (av_opt_get_int(pls->input, "follow_fallback_gvs", AV_OPT_SEARCH_CHILDREN, &fallback_gvs_state) >= 0)
+        pls->prev_fallback_gvs_state = (int)fallback_gvs_state;
 
 cleanup:
     av_dict_free(&opts);
@@ -2507,8 +2519,12 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         /* Flush the packet queue of the subdemuxer. */
         ff_read_frame_flush(pls->ctx);
 
+        // сброс сегмента инициализации при перемотке был добавлен в https://git.ffmpeg.org/gitweb/ffmpeg.git/commitdiff/f225f8d7464569c7b917015c26ad30a37a5fbbe2
+        // из-за вызывания тогда проблем с MP4 демуксером; тем не менее сейчас всё нормально работает и без этого сброса
+        // (тестировалось на ВК видео, где как раз HLS чанки поставляются в MP4)
+        // а сброс, наоборот, приводит к предупреждениям "Found duplicated MOOV Atom" и дополнительной задержке при перемотке
         /* Reset the init segment so it's re-fetched and served appropiately */
-        pls->cur_init_section = NULL;
+        // pls->cur_init_section = NULL;
 
         pls->seek_timestamp = seek_timestamp;
         pls->seek_flags = flags;
@@ -2589,7 +2605,7 @@ static const AVOption hls_options[] = {
     {"seg_format_options", "Set options for segment demuxer",
         OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
     {"seg_max_retry", "Maximum number of times to reload a segment on error.",
-     OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 5}, 0, INT_MAX, FLAGS},
+     OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
     {NULL}
 };
 

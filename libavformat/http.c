@@ -103,6 +103,7 @@ typedef struct HTTPContext {
     int post_datalen;
     int is_akamai;
     int is_mediagateway;
+    int is_gvs;
     char *cookies;          ///< holds newline (\n) delimited Set-Cookie header field values (without the "Set-Cookie: " field name)
     /* A dictionary containing cookies keyed by cookie name */
     AVDictionary *cookie_dict;
@@ -180,6 +181,7 @@ static const AVOption options[] = {
     { "offset", "initial byte offset", OFFSET(off), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
     { "end_offset", "try to limit the request to bytes preceding this offset", OFFSET(end_off), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
     { "max_request_size", "(patch) try to limit the request to this many bytes, then reconnect", OFFSET(max_request_size), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
+    { "request_size", "size (in bytes) of requests to make (alias)", OFFSET(max_request_size), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
     { "keepalive_range_requests", "(patch) when performing new range request, try to reuse old established connection when possible, like in HLS demuxer", OFFSET(keepalive_range_requests), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
     { "method", "Override the HTTP method or set the expected HTTP method from a client", OFFSET(method), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
     { "reconnect", "auto reconnect after disconnect before EOF", OFFSET(reconnect), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
@@ -193,7 +195,7 @@ static const AVOption options[] = {
     { "respect_retry_after", "respect the Retry-After header when retrying connections", OFFSET(respect_retry_after), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D },
     { "redirect_cache_tweaks", "(patch) 0 - standard redirect caching, 1 (default) - forcefully enable redirect cache for tested websites (currently only youtube), 2 - forcefully enable for all websites", OFFSET(redir_cache_tweaks), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 2, D | E },
     { "adaptive_backoff", "(patch) reconnect immediately in case of network timeout, rather than using exponential backoff", OFFSET(adaptive_backoff), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
-    { "follow_fallback_gvs", "(patch) use fallback youtube streaming server if primary one is unreachable (experimental)", OFFSET(follow_fallback_gvs), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+    { "follow_fallback_gvs", "(patch) use fallback Google Video Server (Youtube, Google Drive) if primary one is unreachable", OFFSET(follow_fallback_gvs), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 2, D },
     { "resume_by_discard", "(patch) resume from offset by discarding initial bytes when server does not support seeking", OFFSET(resume_by_discard), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
     { "listen", "listen on HTTP", OFFSET(listen), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, D | E },
     { "resource", "The resource requested by a client", OFFSET(resource), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
@@ -356,7 +358,7 @@ static char *redirect_cache_get(HTTPContext *s)
         p++;
         if (*p == '/') p++;
         if (*p == '/') p++;
-        av_log(s, AV_LOG_VERBOSE, "(debug) Redirect cache was helpful with %.*s\n", strcspn(p, "/?#"), p);
+        av_log(s, AV_LOG_VERBOSE, "(debug) Redirect cache was helpful with %.*s\n", (int)strcspn(p, "/?#"), p);
     }
     return delim + 1;
 }
@@ -378,52 +380,89 @@ static int redirect_cache_set(HTTPContext *s, const char *source, const char *de
     return 0;
 }
 
-static void try_gvs_fallback(HTTPContext *s) // спасибо за способ: https://github.com/yt-dlp/yt-dlp/issues/1986 и https://github.com/yt-dlp/yt-dlp/pull/5639/files
+static void try_gvs_fallback(HTTPContext *s, int initial) // спасибо за способ: https://github.com/yt-dlp/yt-dlp/issues/1986 и https://github.com/yt-dlp/yt-dlp/pull/5639/files
 {
+    // если ошибка сети произойдёт до получения первого ответа от сервера (что и бывает чаще всего), сервер (is_gvs) не будет известен
+    // поэтому нужно вручную проверить, что URL соответствует требуемому формату (и что перенаправление затронет лишь поддомен)
+    // этот метод перенаправления работает (и тестировался) как минимум на видео с Ютуба, а также с Гугл диска
     char fallback_uri[MAX_URL_SIZE];
-    char *p = strchr(s->uri, ':');
-    if (p) {
-        p++;
-        if (*p == '/') p++;
-        if (*p == '/') p++;
+    int hls_notation = 0;
+    if (strncmp(s->uri, "https://r", 9)) return;
+    
+    char *rrp = s->uri + 9;
+    if (*rrp == 'r')
+        rrp++;
+    if (*rrp < '0' || *rrp > '9') return;
+    
+    char *mnp = rrp;
+    while (*mnp >= '0' && *mnp <= '9')
+        mnp++;
+    for (int i = 0; i < 3; i++)
+        if (*mnp != '-') return; else mnp++;
+    
+    char *dot_pos = strchr(mnp, '.');
+    char *delim_pos = strpbrk(rrp, "/?#");
+    if (!dot_pos || !delim_pos || dot_pos >= delim_pos || !memchr(dot_pos + 1, '.', delim_pos - (dot_pos + 1))) return;
+    
+    char *fbk_mn_pos = NULL;
+    char *curr_mn_pos = strstr(rrp, "&mn=");
+    if (!curr_mn_pos) {
+        curr_mn_pos = strstr(rrp, "/mn/");
+        hls_notation = 1;
+    }
+    if (curr_mn_pos) {
+        curr_mn_pos += 4;
+        if (strncmp(mnp, curr_mn_pos, dot_pos - mnp)) {
+            av_log(s, AV_LOG_VERBOSE, "(patch) Received and expected GVS mn values do not match ('%.*s' expected, '%.*s' received)\n",
+                    (int)(dot_pos - mnp), mnp, (int)strcspn(curr_mn_pos, "%&,/"), curr_mn_pos);
+            return;
+        }
+        fbk_mn_pos = strpbrk(curr_mn_pos, "%&,/");
+    }
+    
+    if (fbk_mn_pos) {
+        long fvip = 0;
+        char *fvip_pos = strstr(rrp, "&fvip=");
+        if (!fvip_pos)
+            fvip_pos = strstr(rrp, "/fvip/");
+        if (fvip_pos)
+            fvip = strtol(fvip_pos + 6, NULL, 10);
         
-        char *gv_pos = strstr(p, ".googlevideo.com/");
-        char *fallback_mn_pos = strstr(p, "&mn=");
-        if (fallback_mn_pos)
-            fallback_mn_pos += strcspn(++fallback_mn_pos, "%&");
-        
-        if (gv_pos && strchr(p, '/') > gv_pos && fallback_mn_pos) { // работаем только с ютуб-ссылками, содержащими резервный сервер
-            long fvip = 0;
-            char *fvip_pos = strstr(p, "&fvip=");
-            if (fvip_pos)
-                fvip = strtol(fvip_pos + 6, NULL, 10);
-            
-            if (av_strstart(fallback_mn_pos, "%2C", NULL)) {
-                fallback_mn_pos += 3;
-                snprintf(fallback_uri, sizeof(fallback_uri), "%.*srr%ld---%.*s%s&fallback_count=1", // ютуб принимает ссылки и без fallback_count, но пусть будет как в браузере
-                        p - s->uri, s->uri, (fvip > 0 && fvip < INT_MAX) ? fvip : 1, strcspn(fallback_mn_pos, "&"), fallback_mn_pos, gv_pos);
-                
-                if (strncmp(fallback_uri, s->location, strcspn(fallback_uri + (p - s->uri), "/?#") + (p - s->uri) + 1) != 0) {
-                    av_log(s, AV_LOG_WARNING, "(patch) Falling back to secondary gvs: rr%ld---%.*s.googlevideo.com\n", 
-                            (fvip > 0 && fvip < INT_MAX) ? fvip : 1, strcspn(fallback_mn_pos, "&"), fallback_mn_pos);
-                    // в s->url в конечном счёте всегда остаётся изначальный URL потока (кроме случая просмотра по HLS)
-                    // так что достаточно записать "корневое" перенаправление с исходного URL на резервный, и оно будет перманентным
-                    // но если уже случился редирект от сервера, то с него также нужно добавить перенаправление, чтобы оно сработало незамедлительно
-                    av_dict_free(&s->redirect_cache); // очистка кэша перенаправлений
-                    redirect_cache_set(s, s->uri, fallback_uri, INT64_MAX);
-                    if (strcmp(s->uri, s->location) != 0)
-                        redirect_cache_set(s, s->location, fallback_uri, INT64_MAX);
+        if (*fbk_mn_pos == ',' || av_strstart(fbk_mn_pos, "%2C", NULL)) {
+            fbk_mn_pos += (*fbk_mn_pos == ',' ? 1 : 3);
+            for (int off = 0; fbk_mn_pos[off] && !strchr("&/", fbk_mn_pos[off]); off++) {
+                if ((fbk_mn_pos[off] < '0' || fbk_mn_pos[off] > '9') && (fbk_mn_pos[off] < 'a' || fbk_mn_pos[off] > 'z') && fbk_mn_pos[off] != '-') {
+                    av_log(s, AV_LOG_VERBOSE, "(patch) Rejecting potentially broken/unsafe GVS mn redirect: '%.*s'\n", (int)strcspn(fbk_mn_pos, "&/"), fbk_mn_pos);
                     return;
                 }
             }
-            // если ошибка сети произошла уже после перехода на резервный URL (ютуб обычно не выдаёт больше резервных серверов),
-            // то считаем, что резервный сервер, возможно, также недоступен (или же сформирована неверная для ютуба ссылка), и возвращаемся на исходный URL
-            // (при очередной ошибке сети процесс может повториться)
-            if (strcmp(s->uri, s->location) != 0) {  
-                av_log(s, AV_LOG_WARNING, "(patch) Network error on fallback gvs - reverting to primary server\n");
-                av_dict_free(&s->redirect_cache);
-                redirect_cache_set(s, s->location, s->uri, INT64_MAX);
+            
+            snprintf(fallback_uri, sizeof(fallback_uri), "%.*s%ld---%.*s%s%s",
+                    (int)(rrp - s->uri), s->uri, (fvip > 0 && fvip < INT_MAX) ? fvip : 1, (int)strcspn(fbk_mn_pos, "&/"), fbk_mn_pos, dot_pos,
+                    !hls_notation ? "&fallback_count=1" : "");
+            
+            if (initial || strncmp(fallback_uri, s->location, strcspn(fallback_uri + (rrp - s->uri), "/?#") + (int)(rrp - s->uri) + 1) != 0) {
+                av_log(s, initial ? AV_LOG_INFO : AV_LOG_WARNING, "(patch) %s to secondary GVS: %.*s\n",
+                        initial ? "Switching" : "Falling back", (int)strcspn(fallback_uri + 8, "/?#"), fallback_uri + 8); // 8 = strlen("https://")
+                s->follow_fallback_gvs = 2; // переход на резеврный сервер сразу же при открытии потока (для переноса состояния между HLS чанками)
+                // в s->url в конечном счёте всегда остаётся изначальный URL потока (кроме случая просмотра по HLS)
+                // так что достаточно записать "корневое" перенаправление с исходного URL на резервный, и оно будет перманентным
+                // но если уже случился редирект от сервера, то с него также нужно добавить перенаправление, чтобы оно сработало незамедлительно
+                av_dict_free(&s->redirect_cache); // очистка кэша перенаправлений
+                redirect_cache_set(s, s->uri, fallback_uri, INT64_MAX);
+                if (strcmp(s->uri, s->location) != 0)
+                    redirect_cache_set(s, s->location, fallback_uri, INT64_MAX);
+                return;
             }
+        }
+        // если ошибка сети произошла уже после перехода на резервный URL (ютуб обычно не выдаёт больше резервных серверов),
+        // то считаем, что резервный сервер, возможно, также недоступен, и возвращаемся на исходный URL
+        // (при очередной ошибке сети процесс может повториться)
+        if (!initial && strcmp(s->uri, s->location) != 0) {  
+            av_log(s, AV_LOG_WARNING, "(patch) Network error on fallback GVS - reverting to primary server\n");
+            s->follow_fallback_gvs = 1;
+            av_dict_free(&s->redirect_cache);
+            redirect_cache_set(s, s->location, s->uri, INT64_MAX);
         }
     }
 }
@@ -495,7 +534,7 @@ redo:
         // для полноценной работы этой функции должна быть включена опция reconnect_on_network_error (после патча по умолчанию это так),
         // а также не слишком большой таймаут сети (в mpv network-timeout по умолчанию целых 60 секунд, но в моей сборке плеера это вполне разумные 10 с)
         if (s->follow_fallback_gvs && new_connection)
-            try_gvs_fallback(s);
+            try_gvs_fallback(s, 0);
 
         ffurl_closep(&s->hd);
         goto redo;
@@ -542,14 +581,9 @@ redo:
         // для форматов HLS ffmpeg при этом спамит ошибками "Cannot reuse HTTP connection for different host" (https://github.com/mpv-player/mpv/issues/8500),
         // но для DASH происходит всё та же цепочка переподключений, только без сообщений в консоль
         // в реальности же ютуб позволяет многократно пользоваться новой данной им ссылкой всё время её действия, при необходимости перенаправляя ещё раз
-        // с HLS, к сожалению, такой способ не поможет, поскольку там у каждого чанка свой уникальный URL (это ещё одна причина смотреть ютуб именно в форматах DASH)
-        char *gv = "googlevideo.com"; // в коде ffmpeg уже есть особые подходы к серверам Akamai и MediaGateway, поэтому не вижу в такой проверке ничего плохого
-        size_t lenstr = strlen(loc_host);
-        size_t lensuffix = strlen(gv);
-        char *delta_pos = loc_host + lenstr - lensuffix;
-        if (s->redir_cache_tweaks >= 1)
-            if ((lensuffix <= lenstr && strncmp(delta_pos, gv, lensuffix) == 0 && (lenstr == lensuffix || *(delta_pos - 1) == '.')) || s->redir_cache_tweaks >= 2)
-                s->expires = INT64_MAX;
+        // с HLS, к сожалению, такой способ не поможет, поскольку там у каждого чанка свой уникальный URL
+        if ((s->redir_cache_tweaks >= 1 && s->is_gvs) || s->redir_cache_tweaks >= 2)
+            s->expires = INT64_MAX;
 
         if (!s->expires) {
             s->expires = (s->http_code == 301 || s->http_code == 308) ? INT64_MAX : -1;
@@ -595,13 +629,30 @@ int ff_http_do_new_request2(URLContext *h, const char *uri, AVDictionary **opts)
         !(!strcmp(h->prot->name, "http") ||
           !strcmp(h->prot->name, "https")))
         return AVERROR(EINVAL);
+        
+    char *uri_with_fallback = NULL;
+    if (s->follow_fallback_gvs == 2 && s->uri != uri) {
+        // при открытии следующего HLS чанка состояние перехода на резервный GVS сохранится,
+        // но URL нового чанка будет без учёта перехода, из-за чего не пройдёт проверку на возможность реиспользовать соединение
+        // поэтому нужно выполнить переход заранее; однако если ранее Ютуб сам перенаправил на другой сервер,
+        // соединение реиспользовать не получится, так что проверка всё равно необходима
+        av_free(s->uri);
+        s->uri = av_strdup(uri);
+        if (!s->uri)
+            return AVERROR(ENOMEM);
+
+        try_gvs_fallback(s, 1);
+        AVDictionaryEntry *re = av_dict_get(s->redirect_cache, s->uri, NULL, AV_DICT_MATCH_CASE);
+        if (re && strchr(re->value, ';'))
+            uri_with_fallback = strchr(re->value, ';') + 1;
+    }
 
     av_url_split(proto1, sizeof(proto1), NULL, 0,
                  hostname1, sizeof(hostname1), &port1,
                  NULL, 0, s->location);
     av_url_split(proto2, sizeof(proto2), NULL, 0,
                  hostname2, sizeof(hostname2), &port2,
-                 NULL, 0, uri);
+                 NULL, 0, uri_with_fallback ? uri_with_fallback : uri);
     if (port1 != port2 || strncmp(hostname1, hostname2, sizeof(hostname2)) != 0) {
         av_log(h, AV_LOG_ERROR, "Cannot reuse HTTP connection for different host: %s:%d != %s:%d\n",
             hostname1, port1,
@@ -626,11 +677,11 @@ int ff_http_do_new_request2(URLContext *h, const char *uri, AVDictionary **opts)
         s->off       = 0;
 
     av_free(s->location);
-    s->location = av_strdup(uri);
+    s->location = av_strdup(uri_with_fallback ? uri_with_fallback : uri);
     if (!s->location)
         return AVERROR(ENOMEM);
 
-    if (s->uri != uri) { // в случае нового range request URL остаётся тем же и для простоты передаётся той же строкой
+    if (!uri_with_fallback && s->uri != uri) { // в случае нового range request URL остаётся тем же и для простоты передаётся той же строкой
         av_free(s->uri);
         s->uri = av_strdup(uri);
         if (!s->uri)
@@ -859,6 +910,9 @@ static int http_open(URLContext *h, const char *uri, int flags,
     if (s->listen) {
         return http_listen(h, uri, flags, options);
     }
+    if (s->follow_fallback_gvs == 2)
+        try_gvs_fallback(s, 1);
+    
     ret = http_open_cnx(h, options);
 bail_out:
     if (ret < 0) {
@@ -1347,6 +1401,8 @@ static int process_line(URLContext *h, char *line, int line_count, int *parsed_h
                 s->is_akamai = 1;
             } else if (!av_strncasecmp(p, "MediaGateway", 12)) {
                 s->is_mediagateway = 1;
+            } else if (!av_strncasecmp(p, "gvs 1.0", 7)) {
+                s->is_gvs = 1;
             }
         } else if (!av_strcasecmp(tag, "Content-Type")) {
             av_free(s->mime_type);
